@@ -85,19 +85,33 @@ jobs:
           export PATH=$HOME/clang/bin:$PATH
           cd "$KSRC"
 
+          # make 会自动在参数前补 "arch/arm64/configs/"，所以这里只能传相对名。
+          # 传完整路径会拼成 arch/arm64/configs/arch/arm64/configs/... 而失败。
           CFG="${{ github.event.inputs.kernel_config || '' }}"
           if [ -z "$CFG" ]; then
-            for c in arch/arm64/configs/vendor/kona-perf_defconfig \
-                     arch/arm64/configs/vendor/kona_defconfig \
-                     arch/arm64/configs/defconfig; do
-              [ -f "$c" ] && { CFG="$c"; break; }
+            for c in vendor/kona-perf_defconfig \
+                     vendor/kona_defconfig \
+                     defconfig; do
+              if [ -f "arch/arm64/configs/$c" ]; then CFG="$c"; break; fi
             done
           fi
-          [ -n "$CFG" ] || { echo "::error::no defconfig"; exit 1; }
-          echo "defconfig: $CFG"
+          if [ -z "$CFG" ]; then
+            echo "::error::no defconfig found in arch/arm64/configs/"
+            ls arch/arm64/configs/ | head -40
+            exit 1
+          fi
+          echo "defconfig (relative):  $CFG"
+          echo "defconfig (on disk):   arch/arm64/configs/$CFG"
 
-          # 用老 gcc 风格生成 .config（这一步不需要交叉编译器）
-          make ARCH=arm64 O=out "$CFG"
+          if ! make ARCH=arm64 O=out "$CFG"; then
+            echo "::warning::$CFG failed, falling back to defconfig"
+            CFG=defconfig
+            rm -rf out
+            make ARCH=arm64 O=out defconfig
+          fi
+
+          [ -f out/.config ] || { echo "::error::out/.config missing"; exit 1; }
+          echo "--- .config generated: $(wc -l < out/.config) lines ---"
 
           # 关掉一切会拖慢或阻断外部模块构建的选项
           ./scripts/config --file out/.config \
