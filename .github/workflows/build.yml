@@ -17,24 +17,14 @@ on:
         description: 'defconfig bare name (empty = auto-detect)'
         required: false
         default: ''
+      force_vermagic:
+        description: 'UTS_RELEASE to write into the tree'
+        required: false
+        default: '4.19.152-perf+'
 
 env:
-  # Kernel source lives outside the workspace so it cannot collide with
-  # this repository's own kernel/ directory (which holds the module).
   KSRC: /home/runner/ksrc
-
-  # 4.19's Makefile only sets CLANG_TARGET when CROSS_COMPILE is non-empty:
-  #
-  #   ifeq ($(cc-name),clang)
-  #   ifneq ($(CROSS_COMPILE),)
-  #   CLANG_TRIPLE ?= $(CROSS_COMPILE)
-  #   CLANG_TARGET := --target=$(notdir $(CLANG_TRIPLE:%-=%))
-  #
-  # With CROSS_COMPILE unset, clang keeps its host default target (x86_64)
-  # and then cannot assemble the arm64 inline asm in asm-offsets.c, which
-  # fails with a dozen errors. CROSS_COMPILE also tells kbuild where to
-  # find as/ld/objcopy for the target.
-  CROSS_COMPILE: aarch64-linux-gnu-
+  CROSS: aarch64-linux-gnu-
 
 jobs:
   build:
@@ -51,30 +41,17 @@ jobs:
           sudo apt-get clean
           df -h /
 
-      - name: Install build deps
+      - name: Install aarch64 cross gcc
         run: |
+          set -e
           sudo apt-get update -qq
           sudo apt-get install -y -qq bc bison build-essential flex \
             libssl-dev libelf-dev python3 python-is-python3 \
             zip unzip xz-utils cpio rsync git wget curl \
             device-tree-compiler \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-          echo "--- cross toolchain ---"
-          aarch64-linux-gnu-gcc --version | head -1 || true
-          aarch64-linux-gnu-ld --version | head -1 || true
-          echo "--- openssl ---"
-          openssl version || true
-
-      - name: Fetch prebuilt clang
-        run: |
-          set -e
-          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-11.0.0_r48/clang-r383902b.tar.gz"
-          mkdir -p $HOME/clang
-          wget -q --tries=3 --timeout=120 -O /tmp/clang.tar.gz "$URL"
-          tar -xzf /tmp/clang.tar.gz -C $HOME/clang
-          $HOME/clang/bin/clang --version
-          echo "--- clang default target ---"
-          echo | $HOME/clang/bin/clang -E -x c - 2>/dev/null | grep -i target || true
+          aarch64-linux-gnu-gcc --version | head -1
+          aarch64-linux-gnu-ld --version | head -1
 
       - name: Clone kernel source
         run: |
@@ -84,26 +61,20 @@ jobs:
           echo "repo=$REPO ref=$REF dest=$KSRC"
           rm -rf "$KSRC"
           if git clone --depth=1 --branch "$REF" "https://github.com/$REPO.git" "$KSRC"; then
-            echo "cloned with explicit branch"
+            echo 'cloned with explicit branch'
           else
-            echo "::warning::branch '$REF' missing, using default branch"
+            echo '::warning::branch missing, using default'
             rm -rf "$KSRC"
             git clone --depth=1 "https://github.com/$REPO.git" "$KSRC"
           fi
           cd "$KSRC"
-          echo "--- kernel version ---"
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) ' Makefile
           du -sh "$KSRC"
 
       - name: Configure kernel
         run: |
           set -e
-          export PATH=$HOME/clang/bin:$PATH
           cd "$KSRC"
-
-          # "make <name>" prepends arch/arm64/configs/ itself, so pass the
-          # bare name. Passing a full path doubles the prefix and fails with
-          # "Can't find default configuration arch/arm64/configs/arch/arm64/..."
           CFG="${{ github.event.inputs.kernel_config || '' }}"
           if [ -z "$CFG" ]; then
             for c in vendor/kona-perf_defconfig vendor/kona_defconfig defconfig; do
@@ -111,25 +82,19 @@ jobs:
             done
           fi
           if [ -z "$CFG" ]; then
-            echo "::error::no defconfig found in arch/arm64/configs/"
+            echo '::error::no defconfig found'
             ls arch/arm64/configs/ | head -40
             exit 1
           fi
           echo "defconfig: $CFG"
-
-          if ! make ARCH=arm64 CROSS_COMPILE=$(CROSS_COMPILE) O=out "$CFG"; then
-            echo "::warning::$CFG failed, falling back to defconfig"
+          if ! make ARCH=arm64 CROSS_COMPILE=$CROSS O=out "$CFG"; then
+            echo '::warning::defconfig failed, falling back'
             rm -rf out
             CFG=defconfig
-            make ARCH=arm64 CROSS_COMPILE=$(CROSS_COMPILE) O=out defconfig
+            make ARCH=arm64 CROSS_COMPILE=$CROSS O=out defconfig
           fi
-          [ -f out/.config ] || { echo "::error::out/.config missing"; exit 1; }
-          echo ".config lines: $(wc -l < out/.config)"
-
-          # Drop everything that either blocks an external-module build on
-          # 4.19 or only adds build time. MODULE_SIG is disabled because
-          # 4.19's scripts/sign-file.c uses OpenSSL 1.x APIs that do not
-          # exist in Ubuntu 22.04's OpenSSL 3.x.
+          [ -f out/.config ] || { echo '::error::out/.config missing'; exit 1; }
+          echo "config lines: $(wc -l < out/.config)"
           ./scripts/config --file out/.config \
             -d LTO -d LTO_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL \
             -d CFI_CLANG -d SHADOW_CALL_STACK \
@@ -138,91 +103,116 @@ jobs:
             -d TRIM_UNUSED_KSYMS \
             -e MODULES -e MODULE_UNLOAD -e MODVERSIONS \
             -e KALLSYMS -e KALLSYMS_ALL 2>/dev/null || true
-
-          make ARCH=arm64 CROSS_COMPILE=$(CROSS_COMPILE) O=out olddefconfig
-
-          echo "--- relevant config ---"
+          make ARCH=arm64 CROSS_COMPILE=$CROSS O=out olddefconfig
           grep -E '^CONFIG_(MODULES|MODULE_UNLOAD|MODVERSIONS|MODULE_SIG|KALLSYMS|LTO|CFI_CLANG|DEBUG_INFO_BTF)=' out/.config || true
 
-      - name: Build vmlinux.symvers
+      - name: Prepare
         run: |
           set +e
-          export PATH=$HOME/clang/bin:$PATH
           cd "$KSRC"
-          MAKE="make ARCH=arm64 CC=clang CROSS_COMPILE=$(CROSS_COMPILE) O=out"
+          make ARCH=arm64 CROSS_COMPILE=$CROSS O=out -j1 modules_prepare > /tmp/prepare.log 2>&1
+          RC=$?
+          echo "rc=$RC"
+          if [ $RC -ne 0 ]; then
+            echo '::error::modules_prepare failed'
+            {
+              echo '### modules_prepare FAILED'
+              echo ''
+              echo '#### error context'
+              grep -n -B4 -A14 -E 'error:|Error [0-9]|No such file|cannot' /tmp/prepare.log | head -150
+              echo ''
+              echo '#### tail'
+              tail -80 /tmp/prepare.log
+            } >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          echo 'prepare ok'
 
-          echo "===== prepare (serial, so the first error is visible) ====="
-          $MAKE -j1 prepare modules_prepare > /tmp/prepare.log 2>&1
-          PREP_RC=$?
-          echo "prepare rc=$PREP_RC"
-
-          if [ $PREP_RC -ne 0 ]; then
-            echo "::error::prepare failed"
-            echo "----- grep error context -----"
-            grep -n -B4 -A14 -E "error:|Error [0-9]|No such file|not found" /tmp/prepare.log | head -150
-            echo "----- tail -----"
-            tail -60 /tmp/prepare.log
+      - name: Force vermagic
+        run: |
+          set -e
+          cd "$KSRC"
+          VM="${{ github.event.inputs.force_vermagic || '4.19.152-perf+' }}"
+          UTS=out/include/generated/utsrelease.h
+          echo "target vermagic: $VM"
+          if [ -f "$UTS" ]; then
+            echo '--- before ---'; cat "$UTS"
+            printf '#define UTS_RELEASE "%s"\n' "$VM" > "$UTS"
+            echo '--- after ---'; cat "$UTS"
+          else
+            echo '::error::utsrelease.h missing'
+            find out/include -name 'utsrelease*' | head
             exit 1
           fi
 
-          echo "===== vmlinux (parallel) ====="
-          $MAKE -j$(nproc) vmlinux > /tmp/vmlinux.log 2>&1
-          echo "vmlinux rc=$?"
-
+      - name: Build vmlinux
+        run: |
+          set +e
+          cd "$KSRC"
+          make ARCH=arm64 CROSS_COMPILE=$CROSS O=out -j$(nproc) vmlinux > /tmp/vmlinux.log 2>&1
+          RC=$?
+          echo "rc=$RC"
           if [ ! -f out/vmlinux.symvers ]; then
-            echo "::error::out/vmlinux.symvers not produced"
-            echo "----- grep error context -----"
-            grep -n -B4 -A14 -E "error:|Error [0-9]" /tmp/vmlinux.log | head -150
-            echo "----- tail -----"
-            tail -80 /tmp/vmlinux.log
+            echo '::error::vmlinux.symvers not produced'
+            {
+              echo '### vmlinux FAILED'
+              echo ''
+              echo '#### error context'
+              grep -n -B4 -A14 -E 'error:|Error [0-9]' /tmp/vmlinux.log | head -150
+              echo ''
+              echo '#### tail'
+              tail -80 /tmp/vmlinux.log
+            } >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
-
           ln -sf vmlinux.symvers out/Module.symvers
-          echo "Module.symvers: $(wc -l < out/vmlinux.symvers) symbols"
+          echo "symvers: $(wc -l < out/vmlinux.symvers) symbols"
 
       - name: Build pathshield.ko
         run: |
           set +e
-          export PATH=$HOME/clang/bin:$PATH
           cd "$GITHUB_WORKSPACE/kernel"
-          make -C "$KSRC" M="$GITHUB_WORKSPACE/kernel" \
-            ARCH=arm64 CC=clang CROSS_COMPILE=$(CROSS_COMPILE) O="$KSRC/out" modules \
-            > /tmp/module.log 2>&1
+          make -C "$KSRC" M="$GITHUB_WORKSPACE/kernel" ARCH=arm64 CROSS_COMPILE=$CROSS O="$KSRC/out" modules > /tmp/module.log 2>&1
           RC=$?
-          echo "module build rc=$RC"
-          echo "----- errors -----"
-          grep -n -B3 -A12 -E "error:|Error [0-9]" /tmp/module.log | head -120
-          echo "----- tail -----"
-          tail -50 /tmp/module.log
-          ls -la *.ko 2>/dev/null || { echo "::error::no .ko produced"; exit 1; }
-          exit 0
+          echo "rc=$RC"
+          if [ $RC -ne 0 ] || ! ls *.ko >/dev/null 2>&1; then
+            echo '::error::module build failed'
+            {
+              echo '### module build FAILED'
+              echo ''
+              grep -n -B4 -A14 -E 'error:|Error [0-9]' /tmp/module.log | head -120
+              echo ''
+              tail -60 /tmp/module.log
+            } >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          ls -la *.ko
 
       - name: Inspect module
         run: |
-          export PATH=$HOME/clang/bin:$PATH
+          set -e
           cd "$GITHUB_WORKSPACE/kernel"
-          KO=$(ls *.ko 2>/dev/null | head -1)
-          [ -n "$KO" ] || { echo "no ko"; exit 0; }
-          echo "=== $KO ==="
-          ls -l "$KO"
-          echo ""
-          echo "=== vermagic (must read 4.19.152-perf+) ==="
-          llvm-readelf -p .modinfo "$KO" 2>/dev/null | grep -E 'vermagic|name=|depends' || true
-          echo ""
-          echo "=== sections ==="
-          llvm-readelf -S "$KO" 2>/dev/null | grep -E '__versions|\.text|\.modinfo|\.data' || true
-          echo ""
-          echo "=== undefined symbols (all must exist on device) ==="
-          llvm-nm -u "$KO" 2>/dev/null | sed 's/^ *U *//' | sort | head -60 || true
-          echo ""
-          echo "=== reference: device kernelsu.ko is 270512 bytes ==="
+          KO=$(ls *.ko | head -1)
+          {
+            echo '## pathshield.ko'
+            echo ''
+            echo "- file: $KO"
+            echo "- size: $(stat -c%s "$KO") bytes"
+            echo ''
+            echo '### vermagic'
+            aarch64-linux-gnu-readelf -p .modinfo "$KO" | grep -E 'vermagic|name=|depends' || true
+            echo ''
+            echo '### undefined symbols'
+            aarch64-linux-gnu-nm -u "$KO" | sed 's/^ *U *//' | sort | head -60 || true
+          } | tee /tmp/inspect.txt
+          cat /tmp/inspect.txt >> $GITHUB_STEP_SUMMARY
+          echo 'reference: device kernelsu.ko = 270512 bytes'
 
       - name: Collect artifact
         run: |
           mkdir -p out
           cp "$GITHUB_WORKSPACE"/kernel/*.ko out/ 2>/dev/null || true
-          cp /tmp/prepare.log /tmp/vmlinux.log /tmp/module.log out/ 2>/dev/null || true
+          cp /tmp/prepare.log /tmp/vmlinux.log /tmp/module.log /tmp/inspect.txt out/ 2>/dev/null || true
           ls -la out/
 
       - uses: actions/upload-artifact@v4
