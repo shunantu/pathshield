@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# pathshield 内核模块构建
+#
+# 采用分层结构，每个子目录一个 obj-y 汇总：
+#   core/    基础设施（guard）
+#   arch/    arm64 指令编码与内核代码写入
+#   hook/    hook 引擎与注册表
+#   match/   路径匹配
+#   config/  配置解析与存储
+#   api/     模块入口
+#
+# 新增文件只需加进对应子目录的 Makefile，本文件不用动。
+
+obj-m += pathshield.o
+
+pathshield-y := \
+	api/module.o \
+	core/guard.o \
+	arch/insn.o \
+	arch/text.o \
+	hook/engine.o \
+	hook/manager.o \
+	hook/points/inode_perm.o \
+	hook/points/getattr.o \
+	hook/points/filldir.o \
+	match/inode.o \
+	match/name.o \
+	match/glob.o \
+	config/param.o \
+	config/parse.o \
+	config/resolve.o \
+	config/store.o
+
+# 头文件搜索路径：所有源文件统一从 include/ 引用
+ccflags-y += -I$(src)/include
+
+# 关掉对本模块无意义的告警（内核模块代码风格与用户态不同）
+ccflags-y += -Wno-declaration-after-statement
+ccflags-y += -Wno-unused-function
+ccflags-y += -Wno-missing-prototypes
+ccflags-y += -Wno-strict-prototypes
+ccflags-y += -Wno-sign-compare

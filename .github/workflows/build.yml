@@ -1,0 +1,97 @@
+name: Build pathshield.ko
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: '4.19 kernel source repository'
+        required: false
+        default: 'UtsavBalar1231/kernel_xiaomi_sm8250'
+      kernel_ref:
+        description: 'branch / tag / commit'
+        required: false
+        default: 'main'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk/ndk || true
+          df -h
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev \
+            git make gcc python3 zip unzip xz-utils cpio rsync
+
+      - name: Fetch prebuilt clang
+        run: |
+          # AOSP clang r383902 (clang 10.0.5) - matches the device banner
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-11.0.0_r48/clang-r383902b.tar.gz"
+          curl -sSL "$URL" -o clang.tar.gz
+          mkdir -p $HOME/clang
+          tar -xzf clang.tar.gz -C $HOME/clang
+          $HOME/clang/bin/clang --version
+
+      - name: Clone kernel source (depth 1)
+        run: |
+          REPO="${{ github.event.inputs.kernel_repo || 'UtsavBalar1231/kernel_xiaomi_sm8250' }}"
+          REF="${{ github.event.inputs.kernel_ref || 'main' }}"
+          echo "cloning https://github.com/$REPO at $REF"
+          git clone --depth=1 --branch "$REF" "https://github.com/$REPO.git" kernel || \
+          git clone --depth=1 "https://github.com/$REPO.git" kernel
+          du -sh kernel
+
+      - name: Prepare kernel build
+        run: |
+          cd kernel
+          export PATH=$HOME/clang/bin:$PATH
+          # 4.19 out-of-tree module builds need a configured tree
+          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 O=out vendor/kona-perf_defconfig 2>/dev/null || \
+          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 O=out defconfig
+          # Disable LTO/CFI: they break external module linking and blow memory
+          ./scripts/config --file out/.config -d LTO_CLANG -d LTO_CLANG_THIN -d CFI_CLANG || true
+          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 O=out olddefconfig
+          # Only vmlinux.symvers is needed, not a full vmlinux
+          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 O=out -j$(nproc) vmlinux || true
+          if [ -f out/vmlinux.symvers ]; then
+            ln -sf vmlinux.symvers out/Module.symvers
+            echo "Module.symvers OK"
+          else
+            echo "::error::vmlinux.symvers not produced"
+            ls -la out/ | tail -30
+            exit 1
+          fi
+
+      - name: Build pathshield.ko
+        run: |
+          export PATH=$HOME/clang/bin:$PATH
+          cd kernel/kernel/pathshield 2>/dev/null || cd "$GITHUB_WORKSPACE/kernel"
+          echo "building in $(pwd)"
+          make -C "$GITHUB_WORKSPACE/kernel" M="$GITHUB_WORKSPACE/kernel" \
+            ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 O=out modules 2>&1 | tail -40
+
+      - name: Collect artifact
+        run: |
+          mkdir -p out
+          find "$GITHUB_WORKSPACE/kernel" -name 'pathshield.ko' -exec cp {} out/ \;
+          ls -la out/
+          if [ -f out/pathshield.ko ]; then
+            $HOME/clang/bin/llvm-objdump -p out/pathshield.ko | head -30 || true
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pathshield-ko
+          path: out/pathshield.ko
+          if-no-files-found: warn

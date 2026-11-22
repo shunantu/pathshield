@@ -1,0 +1,24 @@
+# 构建产物
+*.o
+*.ko
+*.mod
+*.mod.c
+*.symvers
+*.order
+.tmp_versions/
+modules.order
+Module.symvers
+
+# 打包产物
+out/
+*.zip
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# 归档（v1 备份，不推到仓库）
+_archive/

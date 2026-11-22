@@ -1,0 +1,6 @@
+id=pathshield
+name=PathShield 路径遮罩 (4.19)
+version=1.0.0
+versionCode=1
+author=pathshield
+description=VFS-level path masking via inline hooks. Works without CONFIG_KPROBES, covers raw syscalls. Built for iQOO Neo5 活力版 / PD2118 / 4.19.152-perf+.
