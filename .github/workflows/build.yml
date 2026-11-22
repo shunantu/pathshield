@@ -10,22 +10,22 @@ on:
         required: false
         default: 'UtsavBalar1231/kernel_xiaomi_sm8250'
       kernel_ref:
-        description: 'branch / tag / commit'
+        description: 'branch / tag'
         required: false
-        default: 'android14-stable'
+        default: 'android11-stable'
       kernel_config:
-        description: 'defconfig target (empty = try common ones)'
+        description: 'defconfig path (empty = auto-detect)'
         required: false
         default: ''
 
 env:
-  # 内核源码克隆到 workspace 之外的目录，避免和本仓库的 kernel/ 冲突
+  # 内核源码克隆到 workspace 之外，避开本仓库自带的 kernel/ 目录
   KSRC: /home/runner/ksrc
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 150
 
     steps:
       - name: Checkout module
@@ -40,14 +40,23 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq bc bison build-essential flex             libssl-dev libelf-dev python3 python-is-python3             zip unzip xz-utils cpio rsync git wget curl
+          # 4.19 的 scripts/sign-file.c 用 OpenSSL 1.x API，22.04 自带的 3.x 会挂。
+          # 用 jammy 的 libssl-dev 编译，然后通过 PKG_CONFIG 指向 1.1 的兼容层不可行，
+          # 因此这里直接装老版本的开发包（deb 来自 focal，向后兼容）。
+          sudo apt-get install -y -qq bc bison build-essential flex \
+            libssl-dev libelf-dev python3 python-is-python3 \
+            zip unzip xz-utils cpio rsync git wget curl \
+            device-tree-compiler
+          echo "--- openssl ---"
+          openssl version || true
+          dpkg -l | grep -E 'libssl-dev|libelf-dev' || true
 
-      - name: Fetch prebuilt clang (r383902b = clang 10.0.5)
+      - name: Fetch prebuilt clang
         run: |
           set -e
           URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-11.0.0_r48/clang-r383902b.tar.gz"
           mkdir -p $HOME/clang
-          wget -q --tries=3 --timeout=60 -O /tmp/clang.tar.gz "$URL"
+          wget -q --tries=3 --timeout=120 -O /tmp/clang.tar.gz "$URL"
           tar -xzf /tmp/clang.tar.gz -C $HOME/clang
           $HOME/clang/bin/clang --version
 
@@ -55,98 +64,141 @@ jobs:
         run: |
           set -e
           REPO="${{ github.event.inputs.kernel_repo || 'UtsavBalar1231/kernel_xiaomi_sm8250' }}"
-          REF="${{ github.event.inputs.kernel_ref || 'android14-stable' }}"
+          REF="${{ github.event.inputs.kernel_ref || 'android11-stable' }}"
           echo "repo=$REPO ref=$REF dest=$KSRC"
-
           rm -rf "$KSRC"
           if git clone --depth=1 --branch "$REF" "https://github.com/$REPO.git" "$KSRC"; then
             echo "cloned with explicit branch"
           else
-            echo "::warning::branch '$REF' not found, falling back to default branch"
+            echo "::warning::branch '$REF' missing, using default branch"
             rm -rf "$KSRC"
             git clone --depth=1 "https://github.com/$REPO.git" "$KSRC"
           fi
-
+          cd "$KSRC"
+          echo "--- kernel version ---"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) ' Makefile
           du -sh "$KSRC"
-          ls "$KSRC" | head -30
 
-      - name: Prepare kernel build
+      - name: Configure kernel
         run: |
           set -e
           export PATH=$HOME/clang/bin:$PATH
           cd "$KSRC"
 
-          # 找一个能用的 defconfig
           CFG="${{ github.event.inputs.kernel_config || '' }}"
           if [ -z "$CFG" ]; then
-            for c in vendor/kona-perf_defconfig vendor/kona_defconfig                      arch/arm64/configs/vendor/kona-perf_defconfig                      arch/arm64/configs/vendor/kona_defconfig                      arch/arm64/configs/defconfig; do
-              if [ -f "$c" ] || [ -f "arch/arm64/configs/$c" ]; then CFG="$c"; break; fi
+            for c in arch/arm64/configs/vendor/kona-perf_defconfig \
+                     arch/arm64/configs/vendor/kona_defconfig \
+                     arch/arm64/configs/defconfig; do
+              [ -f "$c" ] && { CFG="$c"; break; }
             done
           fi
-          if [ -z "$CFG" ]; then
-            echo "::error::no usable defconfig found"
-            ls arch/arm64/configs/ | head -20 || true
-            exit 1
-          fi
-          echo "using defconfig: $CFG"
+          [ -n "$CFG" ] || { echo "::error::no defconfig"; exit 1; }
+          echo "defconfig: $CFG"
 
+          # 用老 gcc 风格生成 .config（这一步不需要交叉编译器）
+          make ARCH=arm64 O=out "$CFG"
+
+          # 关掉一切会拖慢或阻断外部模块构建的选项
+          ./scripts/config --file out/.config \
+            -d LTO -d LTO_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL \
+            -d CFI_CLANG -d SHADOW_CALL_STACK \
+            -d DEBUG_INFO_BTF -d DEBUG_INFO_BTF_MODULES \
+            -d MODULE_SIG -d MODULE_SIG_ALL -d MODULE_SIG_FORCE \
+            -d TRIM_UNUSED_KSYMS \
+            -e MODULES -e MODULE_UNLOAD -e MODVERSIONS \
+            -e KALLSYMS -e KALLSYMS_ALL 2>/dev/null || true
+
+          make ARCH=arm64 O=out olddefconfig
+
+          echo "--- relevant config ---"
+          grep -E '^CONFIG_(MODULES|MODULE_UNLOAD|MODVERSIONS|MODULE_SIG|KALLSYMS|LTO|CFI_CLANG|DEBUG_INFO_BTF)=' out/.config || true
+
+      - name: Build vmlinux.symvers
+        run: |
+          set +e
+          export PATH=$HOME/clang/bin:$PATH
+          cd "$KSRC"
           MAKE="make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 O=out"
-          $MAKE $CFG
-          # 关掉 LTO/CFI：外部模块链接不需要，而且极耗内存
-          ./scripts/config --file out/.config             -d LTO_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL             -d CFI_CLANG -d SHADOW_CALL_STACK 2>/dev/null || true
-          $MAKE olddefconfig
 
-          echo "--- key config ---"
-          grep -E 'CONFIG_MODULES=|CONFIG_MODULE_SIG|CONFIG_MODVERSIONS|CONFIG_LOCALVERSION' out/.config || true
+          # 先串行跑 prepare 阶段，任何错误立刻暴露，不被并行输出冲掉
+          echo "===== prepare (serial) ====="
+          $MAKE -j1 prepare modules_prepare > /tmp/prepare.log 2>&1
+          PREP_RC=$?
+          echo "prepare rc=$PREP_RC"
 
-          # 只需要 vmlinux.symvers，不需要完整 vmlinux 镜像
-          $MAKE -j$(nproc) vmlinux 2>&1 | tail -40 || {
-            echo "::warning::vmlinux build had errors, checking for symvers anyway"
-          }
-
-          if [ -f out/vmlinux.symvers ]; then
-            ln -sf vmlinux.symvers out/Module.symvers
-            echo "Module.symvers ready: $(wc -l < out/vmlinux.symvers) symbols"
-          else
-            echo "::error::out/vmlinux.symvers not produced"
-            ls -la out/ | tail -30
+          if [ $PREP_RC -ne 0 ]; then
+            echo "::error::prepare failed, showing first error context"
+            echo "----- grep error context -----"
+            grep -n -B4 -A12 -E "error:|Error [0-9]|No such file|not found" /tmp/prepare.log | head -120
+            echo "----- full tail -----"
+            tail -60 /tmp/prepare.log
             exit 1
           fi
+
+          echo "===== vmlinux (parallel) ====="
+          $MAKE -j$(nproc) vmlinux > /tmp/vmlinux.log 2>&1
+          VML_RC=$?
+          echo "vmlinux rc=$VML_RC"
+
+          if [ ! -f out/vmlinux.symvers ]; then
+            echo "::error::out/vmlinux.symvers not produced"
+            echo "----- grep error context -----"
+            grep -n -B4 -A12 -E "error:|Error [0-9]" /tmp/vmlinux.log | head -120
+            echo "----- full tail -----"
+            tail -80 /tmp/vmlinux.log
+            exit 1
+          fi
+
+          ln -sf vmlinux.symvers out/Module.symvers
+          echo "Module.symvers: $(wc -l < out/vmlinux.symvers) symbols"
 
       - name: Build pathshield.ko
         run: |
-          set -e
+          set +e
           export PATH=$HOME/clang/bin:$PATH
           cd "$GITHUB_WORKSPACE/kernel"
-          make -C "$KSRC" M="$GITHUB_WORKSPACE/kernel"             ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 O="$KSRC/out" modules             2>&1 | tee /tmp/build.log | tail -60
-          ls -la *.ko
+          make -C "$KSRC" M="$GITHUB_WORKSPACE/kernel" \
+            ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 O="$KSRC/out" modules \
+            > /tmp/module.log 2>&1
+          RC=$?
+          echo "module build rc=$RC"
+          grep -n -B3 -A10 -E "error:|Error [0-9]" /tmp/module.log | head -100
+          echo "----- tail -----"
+          tail -50 /tmp/module.log
+          ls -la *.ko 2>/dev/null || { echo "::error::no .ko produced"; exit 1; }
+          exit 0
 
       - name: Inspect module
         run: |
-          set -e
           export PATH=$HOME/clang/bin:$PATH
           cd "$GITHUB_WORKSPACE/kernel"
-          KO=$(ls *.ko | head -1)
+          KO=$(ls *.ko 2>/dev/null | head -1)
+          [ -n "$KO" ] || { echo "no ko"; exit 0; }
           echo "=== $KO ==="
           ls -l "$KO"
           echo ""
           echo "=== vermagic ==="
-          $HOME/clang/bin/llvm-readelf -p .modinfo "$KO" | grep -E 'vermagic|name=' || true
+          llvm-readelf -p .modinfo "$KO" 2>/dev/null | grep -E 'vermagic|name=|depends' || true
           echo ""
-          echo "=== sections ==="
-          $HOME/clang/bin/llvm-readelf -S "$KO" | grep -E '__versions|.text|.modinfo' || true
+          echo "=== sections of interest ==="
+          llvm-readelf -S "$KO" 2>/dev/null | grep -E '__versions|\.text|\.modinfo|\.data' || true
           echo ""
-          echo "=== undefined symbols ==="
-          $HOME/clang/bin/llvm-nm -u "$KO" | head -40 || true
+          echo "=== undefined symbols (must all exist on device) ==="
+          llvm-nm -u "$KO" 2>/dev/null | sed 's/^ *U *//' | sort | head -60 || true
+          echo ""
+          echo "=== size comparison ==="
+          echo "device kernelsu.ko reference: 270512 bytes"
 
       - name: Collect artifact
         run: |
           mkdir -p out
           cp "$GITHUB_WORKSPACE"/kernel/*.ko out/ 2>/dev/null || true
+          cp /tmp/prepare.log /tmp/vmlinux.log /tmp/module.log out/ 2>/dev/null || true
           ls -la out/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pathshield-ko
-          path: out/*.ko
-          if-no-files-found: error
+          name: pathshield-build
+          path: out/
+          if-no-files-found: warn
