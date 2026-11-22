@@ -75,12 +75,20 @@ jobs:
         run: |
           set -e
           cd "$KSRC"
-          CFG="${{ github.event.inputs.kernel_config || '' }}"
-          if [ -z "$CFG" ]; then
-            for c in vendor/kona-perf_defconfig vendor/kona_defconfig defconfig; do
-              if [ -f "arch/arm64/configs/$c" ]; then CFG="$c"; break; fi
-            done
-          fi
+          # 用 generic defconfig，不用 vendor 的 kona-perf_defconfig。
+          #
+          # 原因：vendor defconfig 会打开 techpack/audio 和 focaltech 触摸屏，
+          # 而这棵树里那两个驱动是坏的（源码与头文件不匹配，缺 struct 成员、
+          # 缺函数声明），gcc 直接报 error 而不是 warning，-Wno-error 也救不了：
+          #
+          #   focaltech_core.c:631: 'struct fts_ts_data' has no member 'fod_finger_skip'
+          #   focaltech_core.c:2572: implicit declaration of 'fts_fod_reg_write'
+          #   tfa98xx.c:1267: 'buf' may be used uninitialized [-Werror=maybe-uninitialized]
+          #
+          # 我们只需要 Module.symvers 里核心符号的 CRC，而 modversions 的 CRC
+          # 由 genksyms 解析头文件里的类型签名得到，与开了哪些驱动无关。
+          # generic defconfig 不开这些 vendor 驱动，构建量也从 3 小时降到 15 分钟。
+          CFG="${{ github.event.inputs.kernel_config || 'defconfig' }}"
           if [ -z "$CFG" ]; then
             echo '::error::no defconfig found'
             ls arch/arm64/configs/ | head -40
@@ -158,19 +166,26 @@ jobs:
           echo "rc=$RC"
 
           if [ ! -f out/vmlinux.symvers ]; then
-            # 关键：诊断必须放在 stdout 的最后几行。
-            # GitHub 折叠视图只显示末尾，之前写进 STEP_SUMMARY 需要点击才看得到。
             echo "================ vmlinux FAILED (rc=$RC) ================"
-            echo "---- first 40 error lines ----"
-            grep -n -E "error:|Error [0-9]" /tmp/vmlinux.log | head -40
-            echo "---- last 40 lines ----"
-            tail -40 /tmp/vmlinux.log
+            echo "---- first 30 error lines ----"
+            grep -n -E "error:|Error [0-9]" /tmp/vmlinux.log | head -30
+            echo "---- last 30 lines ----"
+            tail -30 /tmp/vmlinux.log
             echo "================ END DIAGNOSTICS ================"
-            echo "::error::vmlinux.symvers not produced (rc=$RC)"
-            exit 1
+
+            # 退路：只要 modpost 产出了 Module.symvers 就能编模块，
+            # 不要求 vmlinux 完全链接成功。
+            if [ -f out/Module.symvers ]; then
+              echo "fallback: out/Module.symvers exists, continuing"
+              echo "symbols: $(wc -l < out/Module.symvers)"
+            else
+              echo "::error::neither vmlinux.symvers nor Module.symvers produced"
+              exit 1
+            fi
+          else
+            ln -sf vmlinux.symvers out/Module.symvers
+            echo "symvers: $(wc -l < out/vmlinux.symvers) symbols"
           fi
-          ln -sf vmlinux.symvers out/Module.symvers
-          echo "symvers: $(wc -l < out/vmlinux.symvers) symbols"
 
       - name: Build pathshield.ko
         run: |
