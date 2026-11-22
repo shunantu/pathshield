@@ -114,16 +114,12 @@ jobs:
           RC=$?
           echo "rc=$RC"
           if [ $RC -ne 0 ]; then
+            echo "================ modules_prepare FAILED (rc=$RC) ================"
+            grep -n -E "error:|Error [0-9]|No such file|cannot" /tmp/prepare.log | head -40
+            echo "---- tail ----"
+            tail -40 /tmp/prepare.log
+            echo "================ END DIAGNOSTICS ================"
             echo '::error::modules_prepare failed'
-            {
-              echo '### modules_prepare FAILED'
-              echo ''
-              echo '#### error context'
-              grep -n -B4 -A14 -E 'error:|Error [0-9]|No such file|cannot' /tmp/prepare.log | head -150
-              echo ''
-              echo '#### tail'
-              tail -80 /tmp/prepare.log
-            } >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
           echo 'prepare ok'
@@ -149,20 +145,28 @@ jobs:
         run: |
           set +e
           cd "$KSRC"
-          make ARCH=arm64 CROSS_COMPILE=$CROSS O=out -j$(nproc) vmlinux > /tmp/vmlinux.log 2>&1
+
+          # 4.19 upstream was never built with gcc >= 10. Ubuntu 22.04 ships
+          # gcc 11.4, which turns a pile of old warnings into hard errors
+          # (-Wdesignated-init, -Wstringop-overflow, -Warray-bounds, ...).
+          # KCFLAGS=-Wno-error demotes every one of them back to a warning.
+          KCFLAGS="-Wno-error -Wno-designated-init -Wno-stringop-overflow -Wno-array-bounds -Wno-address-of-packed-member"
+
+          make ARCH=arm64 CROSS_COMPILE=$CROSS O=out -j$(nproc) \
+               KCFLAGS="$KCFLAGS" vmlinux > /tmp/vmlinux.log 2>&1
           RC=$?
           echo "rc=$RC"
+
           if [ ! -f out/vmlinux.symvers ]; then
-            echo '::error::vmlinux.symvers not produced'
-            {
-              echo '### vmlinux FAILED'
-              echo ''
-              echo '#### error context'
-              grep -n -B4 -A14 -E 'error:|Error [0-9]' /tmp/vmlinux.log | head -150
-              echo ''
-              echo '#### tail'
-              tail -80 /tmp/vmlinux.log
-            } >> $GITHUB_STEP_SUMMARY
+            # 关键：诊断必须放在 stdout 的最后几行。
+            # GitHub 折叠视图只显示末尾，之前写进 STEP_SUMMARY 需要点击才看得到。
+            echo "================ vmlinux FAILED (rc=$RC) ================"
+            echo "---- first 40 error lines ----"
+            grep -n -E "error:|Error [0-9]" /tmp/vmlinux.log | head -40
+            echo "---- last 40 lines ----"
+            tail -40 /tmp/vmlinux.log
+            echo "================ END DIAGNOSTICS ================"
+            echo "::error::vmlinux.symvers not produced (rc=$RC)"
             exit 1
           fi
           ln -sf vmlinux.symvers out/Module.symvers
@@ -172,18 +176,17 @@ jobs:
         run: |
           set +e
           cd "$GITHUB_WORKSPACE/kernel"
-          make -C "$KSRC" M="$GITHUB_WORKSPACE/kernel" ARCH=arm64 CROSS_COMPILE=$CROSS O="$KSRC/out" modules > /tmp/module.log 2>&1
+          make -C "$KSRC" M="$GITHUB_WORKSPACE/kernel" ARCH=arm64 CROSS_COMPILE=$CROSS \
+               O="$KSRC/out" KCFLAGS="-Wno-error" modules > /tmp/module.log 2>&1
           RC=$?
           echo "rc=$RC"
           if [ $RC -ne 0 ] || ! ls *.ko >/dev/null 2>&1; then
+            echo "================ module build FAILED (rc=$RC) ================"
+            grep -n -E "error:|Error [0-9]" /tmp/module.log | head -40
+            echo "---- tail ----"
+            tail -40 /tmp/module.log
+            echo "================ END DIAGNOSTICS ================"
             echo '::error::module build failed'
-            {
-              echo '### module build FAILED'
-              echo ''
-              grep -n -B4 -A14 -E 'error:|Error [0-9]' /tmp/module.log | head -120
-              echo ''
-              tail -60 /tmp/module.log
-            } >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
           ls -la *.ko
